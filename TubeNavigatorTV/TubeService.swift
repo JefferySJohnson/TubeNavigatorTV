@@ -89,9 +89,10 @@ struct PlannedDisruption: Identifiable {
     let toDate: String?
 
     var displayLines: String {
-        if lineNames.count == 1 { return lineNames[0] }
-        if lineNames.count >= 10 { return "All Tube lines" }
-        return lineNames.joined(separator: ", ")
+        let names = lineNames.map(displayLineName)
+        if names.count == 1 { return names[0] }
+        if names.count >= 10 { return "All Tube lines" }
+        return names.joined(separator: ", ")
     }
 }
 
@@ -806,6 +807,170 @@ enum ElizabethLineMap {
         case "Shenfield", "Abbey Wood", "Gidea Park": return .east
         case "Reading", "Maidenhead", "Terminal 4", "Terminal 5", "Paddington": return .west
         default: return nil
+        }
+    }
+
+    // MARK: - Live Map arrow-key navigation (v1.19)
+
+    // The branches, for arrow-key navigation on the Live Map.
+    // The main chain (chains[0]) runs Reading to Stratford; the
+    // other four chains are the branches off it. Shenfield and
+    // Terminal 5 are the northern branches, Abbey Wood and
+    // Terminal 4 the southern ones — Up takes the northern
+    // branch of a pair, Down the southern one. Terminals 2 & 3
+    // sits on both Heathrow branches: it is the shared leg into
+    // West Drayton.
+    static let shenfieldBranch: Set<String> = ["Maryland", "Forest Gate", "Manor Park", "Ilford", "Seven Kings", "Goodmayes", "Chadwell Heath", "Romford", "Gidea Park", "Harold Wood", "Brentwood", "Shenfield"]
+    static let abbeyWoodBranch: Set<String> = ["Canary Wharf", "Custom House", "Woolwich", "Abbey Wood"]
+    static let heathrowT5Branch: Set<String> = ["Terminal 5", "Terminals 2 & 3"]
+    static let heathrowT4Branch: Set<String> = ["Terminal 4", "Terminals 2 & 3"]
+
+    /// Which branch a train is on, from the stations either side
+    /// of it. A train on the shared Terminals 2 & 3 leg is
+    /// placed by its destination; one heading for Paddington or
+    /// Reading from there is on the main chain for this purpose.
+    enum MapBranch {
+        case main, shenfield, abbeyWood, terminal5, terminal4
+    }
+
+    static func branch(of train: PositionedTrain) -> MapBranch {
+        let eitherSide = [train.prevStation, train.nextStation].compactMap { $0 }
+        if eitherSide.contains(where: shenfieldBranch.contains) { return .shenfield }
+        if eitherSide.contains(where: abbeyWoodBranch.contains) { return .abbeyWood }
+        if eitherSide.contains("Terminal 5") { return .terminal5 }
+        if eitherSide.contains("Terminal 4") { return .terminal4 }
+        if eitherSide.contains("Terminals 2 & 3") {
+            if train.destination == "Terminal 4" { return .terminal4 }
+            if train.destination == "Terminal 5" { return .terminal5 }
+        }
+        return .main
+    }
+
+    /// Every station on a train's route: the main chain plus its
+    /// own branch. Left/Right stay on this route, so they never
+    /// jump from one branch to the other.
+    static func routeStations(for branch: MapBranch) -> Set<String> {
+        let main = Set(chains[0])
+        switch branch {
+        case .main: return main
+        case .shenfield: return main.union(shenfieldBranch)
+        case .abbeyWood: return main.union(abbeyWoodBranch)
+        case .terminal5: return main.union(heathrowT5Branch)
+        case .terminal4: return main.union(heathrowT4Branch)
+        }
+    }
+
+    /// Scalar west-to-east coordinate for every station, in
+    /// diagram points along its route from Reading: the main
+    /// chain accumulates leg lengths from Reading; each branch
+    /// continues from its junction (the east branches add, the
+    /// west branches subtract, since they run west from West
+    /// Drayton).
+    static let lineCoordinate: [String: Double] = {
+        var coord: [String: Double] = [:]
+        var total: Double = 0
+        for (a, b) in zip(chains[0], chains[0].dropFirst()) {
+            if coord[a] == nil { coord[a] = total }
+            guard let pa = stations[a], let pb = stations[b] else { continue }
+            let dx = Double(pb.x - pa.x)
+            let dy = Double(pb.y - pa.y)
+            total += (dx * dx + dy * dy).squareRoot()
+            coord[b] = total
+        }
+        // East branches: Stratford outward.
+        for chain in [chains[1], chains[2]] {
+            guard let junction = coord[chain[0]] else { continue }
+            var running = junction
+            for (a, b) in zip(chain, chain.dropFirst()) {
+                guard let pa = stations[a], let pb = stations[b] else { continue }
+                let dx = Double(pb.x - pa.x)
+                let dy = Double(pb.y - pa.y)
+                running += (dx * dx + dy * dy).squareRoot()
+                coord[b] = running
+            }
+        }
+        // West branches: West Drayton outward, westward.
+        for chain in [chains[3], chains[4]] {
+            guard let junction = coord[chain.last!] else { continue }
+            var running = junction
+            for (a, b) in zip(chain.reversed(), chain.reversed().dropFirst()) {
+                guard let pa = stations[a], let pb = stations[b] else { continue }
+                let dx = Double(pb.x - pa.x)
+                let dy = Double(pb.y - pa.y)
+                running -= (dx * dx + dy * dy).squareRoot()
+                coord[b] = running
+            }
+        }
+        return coord
+    }()
+
+    /// A train's place along its route, for Left/Right: the
+    /// midpoint of the stations either side of it, with its
+    /// diagram x breaking ties inside one stretch (the train
+    /// further east has the larger x, whichever way it is
+    /// travelling).
+    static func linePosition(of train: PositionedTrain) -> (Double, Double) {
+        let next = lineCoordinate[train.nextStation] ?? 0
+        if let prev = train.prevStation, let prevCoord = lineCoordinate[prev] {
+            return ((prevCoord + next) / 2, train.x)
+        }
+        return (next, train.x)
+    }
+
+    /// The train next along the line from the focused one:
+    /// eastward for Right, westward for Left. Only trains on
+    /// the same route count, so the move never jumps branches.
+    /// Nil when there is no train further that way — focus
+    /// stays where it is.
+    static func lineNeighbour(from train: PositionedTrain, in trains: [PositionedTrain], eastward: Bool) -> PositionedTrain? {
+        let route = routeStations(for: branch(of: train))
+        let here = linePosition(of: train)
+        let candidates = trains.filter { other in
+            guard other.vehicleId != train.vehicleId else { return false }
+            guard route.contains(other.nextStation) else { return false }
+            if let prev = other.prevStation, !route.contains(prev) { return false }
+            return true
+        }
+        if eastward {
+            return candidates
+                .filter { linePosition(of: $0) > here }
+                .min { linePosition(of: $0) < linePosition(of: $1) }
+        }
+        return candidates
+            .filter { linePosition(of: $0) < here }
+            .max { linePosition(of: $0) < linePosition(of: $1) }
+    }
+
+    /// The train on the other branch of the focused train's
+    /// pair, for Up/Down: Up takes the northern branch, Down
+    /// the southern one. A train already on the northern
+    /// branch goes nowhere on Up, and likewise Down on the
+    /// southern branch. A train on the main chain takes the
+    /// nearest train on a northern branch (Up) or a southern
+    /// branch (Down). Nearest means closest on the diagram.
+    /// Nil when the other branch has no trains — focus stays.
+    static func branchNeighbour(from train: PositionedTrain, in trains: [PositionedTrain], north: Bool) -> PositionedTrain? {
+        let northern: Set<String> = shenfieldBranch.union(heathrowT5Branch)
+        let southern: Set<String> = abbeyWoodBranch.union(heathrowT4Branch)
+        let targetStations: Set<String>
+        switch (branch(of: train), north) {
+        case (.shenfield, false): targetStations = abbeyWoodBranch
+        case (.abbeyWood, true): targetStations = shenfieldBranch
+        case (.terminal5, false): targetStations = heathrowT4Branch
+        case (.terminal4, true): targetStations = heathrowT5Branch
+        case (.main, true): targetStations = northern
+        case (.main, false): targetStations = southern
+        default: return nil
+        }
+        let candidates = trains.filter { other in
+            guard other.vehicleId != train.vehicleId else { return false }
+            let eitherSide = [other.prevStation, other.nextStation].compactMap { $0 }
+            return eitherSide.contains(where: targetStations.contains)
+        }
+        return candidates.min { a, b in
+            let da = (a.x - train.x) * (a.x - train.x) + (a.y - train.y) * (a.y - train.y)
+            let db = (b.x - train.x) * (b.x - train.x) + (b.y - train.y) * (b.y - train.y)
+            return da < db
         }
     }
 

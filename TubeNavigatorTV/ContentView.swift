@@ -75,6 +75,13 @@ import UIKit
 // it. Positions are estimated from the minutes to each train's
 // next stop — the Elizabeth line feed never says where a train
 // is — and the tab says so plainly.
+// v1.19: the Live Map dots take over the arrow keys — Left/Right
+// follow the line (the next train along it, never a jump to
+// another branch), Up/Down switch branches (Up the northern
+// branch, Down the southern one). And "Elizabeth Line" is
+// capitalised everywhere it is shown — TfL styles it lowercase
+// and the feed returns it that way, so every displayed line name
+// goes through one mapping; the raw name stays the data key.
 //
 // tvOS notes: the remote moves focus, it does not tap. Every button
 // and card has .focusable() so the list scrolls when you move down
@@ -155,6 +162,14 @@ func appVersionText() -> String {
     let short = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
     let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
     return "TubeNavigatorTV v\(short) (\(build))"
+}
+
+/// TfL styles it "Elizabeth line" (lowercase l) and the feed
+/// returns it that way; the app shows "Elizabeth Line". Every
+/// user-visible line name goes through here — the raw name stays
+/// the data key (the Map tab's highlight paths are keyed on it).
+func displayLineName(_ name: String) -> String {
+    name == "Elizabeth line" ? "Elizabeth Line" : name
 }
 
 // v1.11: the header row every tab shares — Refresh + Updated,
@@ -549,7 +564,7 @@ struct StatusView: View {
                 // The Northern line's dot is black — the ring keeps it
                 // visible against the dark background.
                 .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 1.5))
-            Text(line.name)
+            Text(displayLineName(line.name))
                 .font(.title3)
                 .fontWeight(.bold)
                 // Long names (Hammersmith & City, Elizabeth line) must
@@ -588,7 +603,7 @@ struct LineDetailView: View {
                         .fill(TubeLines.color(for: line.id))
                         .frame(width: 32, height: 32)
                         .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 1.5))
-                    Text(line.name)
+                    Text(displayLineName(line.name))
                         .font(.largeTitle)
                         .fontWeight(.bold)
                     Spacer()
@@ -1111,7 +1126,7 @@ struct MapView: View {
                 .fill(TubeLines.color(for: row.id))
                 .frame(width: 20, height: 20)
                 .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 1.5))
-            Text(row.name)
+            Text(displayLineName(row.name))
                 .font(.title3)
                 .fontWeight(.bold)
                 .lineLimit(1)
@@ -1129,7 +1144,7 @@ struct MapView: View {
                         .fill(TubeLines.color(for: row.id))
                         .frame(width: 28, height: 28)
                         .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 1.5))
-                    Text(row.name)
+                    Text(displayLineName(row.name))
                         .font(.title2)
                         .fontWeight(.bold)
                     Spacer()
@@ -1410,7 +1425,7 @@ struct StationBoardView: View {
     // fetch (or if it fails).
     private func lineName(_ id: String) -> String {
         if let line = service.lineStatuses.first(where: { $0.id == id }) {
-            return line.name
+            return displayLineName(line.name)
         }
         return [
             "bakerloo": "Bakerloo", "central": "Central", "circle": "Circle",
@@ -1419,7 +1434,7 @@ struct StationBoardView: View {
             "metropolitan": "Metropolitan", "northern": "Northern",
             "piccadilly": "Piccadilly", "victoria": "Victoria",
             "waterloo-city": "Waterloo & City",
-        ][id] ?? id
+        ][id].map(displayLineName) ?? id
     }
 
     // One section per platform, in alphabetical platform order
@@ -1532,6 +1547,10 @@ struct StationBoardView: View {
 // minutes); Select pins it. Refresh every 30 seconds while
 // the tab is open, keeping the old trains until a fresh
 // fetch lands.
+// v1.19: the dots take over the arrow keys (moveFocus) —
+// Left/Right follow the line, Up/Down switch branches —
+// so the focus engine's geometric jumps (Left from
+// Stratford landing on Slough) no longer move focus.
 struct LiveMapView: View {
     @EnvironmentObject var service: TubeService
     @AppStorage("TubeNavigatorTV.theme") private var themeRaw = AppTheme.midnight.rawValue
@@ -1552,12 +1571,12 @@ struct LiveMapView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            RefreshHeaderRow(updated: service.lastPositionsUpdate, title: "Elizabeth line live map") {
+            RefreshHeaderRow(updated: service.lastPositionsUpdate, title: "Elizabeth Line live map") {
                 Task { await service.fetchElizabethLinePositions() }
             }
             mapView
             detailStrip
-            Text("Train positions are estimated from TfL arrival times — the Elizabeth line doesn't report where its trains are, so each dot is placed between stations from the minutes to its next stop.")
+            Text("Train positions are estimated from TfL arrival times — the Elizabeth Line doesn't report where its trains are, so each dot is placed between stations from the minutes to its next stop.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
         }
@@ -1599,6 +1618,36 @@ struct LiveMapView: View {
         // same train releases it. Select on another train
         // re-pins to that one.
         pinnedTrain = (pinnedTrain == train.vehicleId) ? nil : train.vehicleId
+    }
+
+    // Arrow-key navigation (v1.19): the dots intercept the
+    // remote's arrows instead of the focus engine, which picks
+    // by its own geometry across the wide schematic. Left/Right
+    // move to the next train along the line; Up/Down switch
+    // branches (Up the northern branch, Down the southern one).
+    // No train that way: focus stays put.
+    private func moveFocus(_ direction: MoveCommandDirection, from train: PositionedTrain) {
+        let trains = service.positionedTrains
+        switch direction {
+        case .left:
+            if let next = ElizabethLineMap.lineNeighbour(from: train, in: trains, eastward: false) {
+                focusedTrain = next.vehicleId
+            }
+        case .right:
+            if let next = ElizabethLineMap.lineNeighbour(from: train, in: trains, eastward: true) {
+                focusedTrain = next.vehicleId
+            }
+        case .up:
+            if let next = ElizabethLineMap.branchNeighbour(from: train, in: trains, north: true) {
+                focusedTrain = next.vehicleId
+            }
+        case .down:
+            if let next = ElizabethLineMap.branchNeighbour(from: train, in: trains, north: false) {
+                focusedTrain = next.vehicleId
+            }
+        default:
+            break
+        }
     }
 
     private var mapView: some View {
@@ -1651,6 +1700,7 @@ struct LiveMapView: View {
                 .buttonStyle(.plain)
                 .frame(width: 34, height: 34)
                 .focused($focusedTrain, equals: train.vehicleId)
+                .onMoveCommand { moveFocus($0, from: train) }
                 .position(x: train.x * scale, y: train.y * scale)
             }
         }
